@@ -92,16 +92,22 @@ def main():
         print(f"[ERROR] Failed to load model '{args.model}': {e}")
         sys.exit(1)
 
+    # Try to move model to GPU, fallback to CPU on failure
     try:
         import torch
         if torch.cuda.is_available():
-            print("[INFO] CUDA enabled")
-            model.to("cuda")
+            try:
+                model.to("cuda")
+                print("[INFO] CUDA enabled - running on GPU")
+            except Exception as e:
+                print(f"[WARN] Failed to move model to GPU: {e}")
+                model.to("cpu")
+                print("[INFO] Running on CPU instead")
         else:
-            print("[INFO] Running on CPU")
+            print("[INFO] CUDA not available, running on CPU")
             model.to("cpu")
-    except Exception:
-        print("[INFO] Torch not found, default device")
+    except ImportError:
+        print("[INFO] PyTorch not installed, running on default device")
 
     print("[INFO] Ready. Hold LEFT MOUSE BUTTON to aim lock.")
     print("[INFO] Press Ctrl+C to exit.")
