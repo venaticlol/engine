@@ -68,7 +68,7 @@ def main():
     parser = argparse.ArgumentParser(description="Instant crosshair lock using relative mouse input.")
     parser.add_argument("--model", type=str, default="yolov8n.pt", help="YOLO model path")
     parser.add_argument("--fov", type=int, default=350, help="Capture size in pixels")
-    parser.add_argument("--conf", type=float, default=0.45, help="Confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.15, help="Confidence threshold")
     parser.add_argument("--iou", type=float, default=0.45, help="IoU threshold")
     parser.add_argument("--aim-height", type=float, default=10.0, help="Aim height factor")
     parser.add_argument("--lock-radius", type=int, default=5, help="Lock radius in pixels")
