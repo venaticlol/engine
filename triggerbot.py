@@ -888,11 +888,12 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     w = MainWindow()
-    w.resize(520, 675)
+    w.resize(520, 785)
     w.show()
 
     sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
+
 
