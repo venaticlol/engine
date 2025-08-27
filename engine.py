@@ -13,6 +13,7 @@ import sys
 import os
 import requests
 from pathlib import Path
+from filterpy.kalman import KalmanFilter
 
 # ------------------- Windows API -------------------
 VK_RBUTTON = 0x02  # Right mouse button
@@ -132,9 +133,13 @@ class Aimbot:
         self.running = False
         self.show_fps = True
         self.aim_method = "Smooth Aim"  # Default aim method
+        self.target_priority = "Closest to Crosshair"  # Default target priority
         # Pre-allocate arrays for performance
         self.lower_bright = np.array([0, 0, 180], dtype=np.uint8)
         self.upper_bright = np.array([180, 30, 255], dtype=np.uint8)
+        # Kalman filter for advanced smoothing
+        self.kalman = None
+        self.kalman_initialized = False
 
     def load_model(self, model_name):
         """Load a YOLO model, downloading if necessary"""
@@ -286,6 +291,7 @@ class AimbotWorker(QThread):
 
                     # Target selection (closest to center) - vectorized
                     head_positions = []
+                    box_sizes = []
                     for box in person_boxes:
                         x1, y1, x2, y2 = map(int, box)
                         h = y2 - y1
@@ -293,6 +299,7 @@ class AimbotWorker(QThread):
                         head_y = int(my - (h / self.core.aim_height))
                         head_x = mx
                         head_positions.append((head_x, head_y))
+                        box_sizes.append((x2 - x1) * (y2 - y1))  # Area of bounding box
 
                     # Vectorized distance calculation
                     head_positions = np.array(head_positions)
@@ -315,10 +322,37 @@ class AimbotWorker(QThread):
                             self.fpsUpdated.emit(fps)
                         continue
 
-                    # Find closest valid target
-                    valid_distances = distances[valid_indices]
-                    closest_idx = valid_indices[np.argmin(valid_distances)]
-                    closest = head_positions[closest_idx]
+                    # Apply target priority
+                    if self.core.target_priority == "Closest to Crosshair":
+                        # Find closest valid target
+                        valid_distances = distances[valid_indices]
+                        closest_idx = valid_indices[np.argmin(valid_distances)]
+                        closest = head_positions[closest_idx]
+                    elif self.core.target_priority == "Largest Target":
+                        # Find largest valid target
+                        valid_sizes = [box_sizes[i] for i in valid_indices]
+                        largest_idx = valid_indices[np.argmax(valid_sizes)]
+                        closest = head_positions[largest_idx]
+                    elif self.core.target_priority == "Smallest Target":
+                        # Find smallest valid target
+                        valid_sizes = [box_sizes[i] for i in valid_indices]
+                        smallest_idx = valid_indices[np.argmin(valid_sizes)]
+                        closest = head_positions[smallest_idx]
+                    elif self.core.target_priority == "Closest and Largest":
+                        # Combine distance and size (normalized)
+                        valid_distances = distances[valid_indices]
+                        valid_sizes = [box_sizes[i] for i in valid_indices]
+                        # Normalize values
+                        norm_distances = valid_distances / np.max(valid_distances)
+                        norm_sizes = np.array(valid_sizes) / np.max(valid_sizes)
+                        # Combine with weights (70% distance, 30% size)
+                        combined_scores = 0.7 * norm_distances + 0.3 * (1 - norm_sizes)
+                        best_idx = valid_indices[np.argmin(combined_scores)]
+                        closest = head_positions[best_idx]
+                    else:  # Default to closest
+                        valid_distances = distances[valid_indices]
+                        closest_idx = valid_indices[np.argmin(valid_distances)]
+                        closest = head_positions[closest_idx]
 
                     if closest is not None:
                         hx, hy = closest
@@ -369,6 +403,71 @@ class AimbotWorker(QThread):
                             factor = max(1.0, distance / self.core.smooth_factor)
                             rel_x /= factor
                             rel_y /= factor
+                        elif self.core.aim_method == "Kalman Filter Aim":
+                            # Initialize Kalman filter on first use
+                            if not self.core.kalman_initialized:
+                                self.core.kalman = KalmanFilter(dim_x=4, dim_z=2)
+                                self.core.kalman.x = np.array([hx, hy, 0, 0])  # Initial state
+                                self.core.kalman.F = np.array([[1, 0, 1, 0],
+                                                              [0, 1, 0, 1],
+                                                              [0, 0, 1, 0],
+                                                              [0, 0, 0, 1]])  # State transition
+                                self.core.kalman.H = np.array([[1, 0, 0, 0],
+                                                              [0, 1, 0, 0]])  # Measurement function
+                                self.core.kalman.P *= 1000  # Covariance
+                                self.core.kalman.R *= 5     # Measurement noise
+                                self.core.kalman.Q *= 0.1   # Process noise
+                                self.core.kalman_initialized = True
+                            
+                            # Predict and update
+                            self.core.kalman.predict()
+                            self.core.kalman.update([hx, hy])
+                            predicted_x, predicted_y = self.core.kalman.x[:2]
+                            
+                            # Calculate movement with smoothing
+                            rel_x = (predicted_x - self.center_x) / max(1.0, self.core.smooth_factor)
+                            rel_y = (predicted_y - self.center_y) / max(1.0, self.core.smooth_factor)
+                        elif self.core.aim_method == "PID Controller Aim":
+                            # Simple PID controller implementation
+                            if not hasattr(self.core, 'pid_x'):
+                                self.core.pid_x = {'prev_error': 0, 'integral': 0}
+                                self.core.pid_y = {'prev_error': 0, 'integral': 0}
+                            
+                            # PID constants
+                            Kp, Ki, Kd = 0.5, 0.1, 0.05
+                            
+                            # X-axis PID
+                            error_x = rel_x
+                            self.core.pid_x['integral'] += error_x
+                            derivative_x = error_x - self.core.pid_x['prev_error']
+                            output_x = Kp * error_x + Ki * self.core.pid_x['integral'] + Kd * derivative_x
+                            self.core.pid_x['prev_error'] = error_x
+                            
+                            # Y-axis PID
+                            error_y = rel_y
+                            self.core.pid_y['integral'] += error_y
+                            derivative_y = error_y - self.core.pid_y['prev_error']
+                            output_y = Kp * error_y + Ki * self.core.pid_y['integral'] + Kd * derivative_y
+                            self.core.pid_y['prev_error'] = error_y
+                            
+                            rel_x = output_x / max(1.0, self.core.smooth_factor)
+                            rel_y = output_y / max(1.0, self.core.smooth_factor)
+                        elif self.core.aim_method == "Bezier Curve Aim":
+                            # Bezier curve interpolation for smooth movement
+                            if self.core.last_target:
+                                # Control points for bezier curve
+                                start = np.array(self.core.last_target)
+                                end = np.array([hx, hy])
+                                control = (start + end) / 2  # Simple midpoint control
+                                
+                                # Calculate point on bezier curve (t=0.5 for mid-point smoothing)
+                                t = 0.5
+                                bezier_point = (1-t)**2 * start + 2*(1-t)*t * control + t**2 * end
+                                rel_x = (bezier_point[0] - self.center_x) / max(1.0, self.core.smooth_factor)
+                                rel_y = (bezier_point[1] - self.center_y) / max(1.0, self.core.smooth_factor)
+                            else:
+                                rel_x /= max(1.0, self.core.smooth_factor)
+                                rel_y /= max(1.0, self.core.smooth_factor)
 
                         send_relative_mouse_move(rel_x, rel_y)
                         self.core.last_target = (hx, hy)
@@ -417,7 +516,7 @@ class MainWindow(QMainWindow):
 
         # Window
         self.setWindowTitle("sakura aimbot UI")
-        self.setMinimumSize(440, 540)
+        self.setMinimumSize(440, 685)
 
         # Icon (gracefully handle if not present)
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sakura.ico")
@@ -515,11 +614,23 @@ class MainWindow(QMainWindow):
         aim_methods = [
             "Smooth Aim", "Linear Aim", "Exponential Aim", "Cubic Aim",
             "Quadratic Aim", "Sinusoidal Aim", "Logarithmic Aim",
-            "Square Root Aim", "Constant Speed", "Jump Aim", "Adaptive Aim"
+            "Square Root Aim", "Constant Speed", "Jump Aim", "Adaptive Aim",
+            "Kalman Filter Aim", "PID Controller Aim", "Bezier Curve Aim"
         ]
         self.aimMethodCombo.addItems(aim_methods)
         self.aimMethodCombo.setCurrentText(self.aimbot.aim_method)
         self.aimMethodCombo.currentTextChanged.connect(self.on_aim_method_changed)
+
+        # Target Priority Dropdown
+        self.targetPriorityLabel = QLabel("Target Priority")
+        self.targetPriorityCombo = QComboBox()
+        target_priorities = [
+            "Closest to Crosshair", "Largest Target", "Smallest Target", 
+            "Closest and Largest"
+        ]
+        self.targetPriorityCombo.addItems(target_priorities)
+        self.targetPriorityCombo.setCurrentText(self.aimbot.target_priority)
+        self.targetPriorityCombo.currentTextChanged.connect(self.on_target_priority_changed)
 
         # Confidence (%)
         self.confLabel = QLabel("Confidence (%)")
@@ -537,7 +648,7 @@ class MainWindow(QMainWindow):
         # Aim Height (head offset divisor)
         self.aimHeightLabel = QLabel("Aim Height Divisor")
         aim_div = int(self.aimbot.aim_height)
-        self.aimHeightSlider = self._slider(5, 30, aim_div, self.on_aim_height_changed)
+        self.aimHeightSlider = self._slider(3, 30, aim_div, self.on_aim_height_changed)
         self.aimHeightBadge = ValueBadge(str(aim_div))
 
         # Layout grid
@@ -553,6 +664,10 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self.aimMethodLabel, row, 0)
         grid.addWidget(self.aimMethodCombo, row, 1, 1, 2)
+        row += 1
+
+        grid.addWidget(self.targetPriorityLabel, row, 0)
+        grid.addWidget(self.targetPriorityCombo, row, 1, 1, 2)
         row += 1
 
         grid.addWidget(self.confLabel, row, 0)
@@ -658,6 +773,10 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_aim_method_changed(self, method: str):
         self.aimbot.aim_method = method
+
+    @Slot(str)
+    def on_target_priority_changed(self, priority: str):
+        self.aimbot.target_priority = priority
 
     # ------------------- Controls -------------------
     @Slot()
@@ -843,12 +962,10 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     w = MainWindow()
-    w.resize(520, 785)
+    w.resize(520, 745)
     w.show()
 
     sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
-
-
