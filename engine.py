@@ -25,6 +25,8 @@ SendInput = user32.SendInput
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
 
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
@@ -55,6 +57,19 @@ def send_absolute_mouse_move(x, y):
     inp = INPUT()
     inp.type = INPUT_MOUSE
     inp.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, None)
+    SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+def click():
+    # Mouse down
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, None)
+    SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    
+    # Mouse up
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, None)
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 def centered_box(screen_w, screen_h, fov):
@@ -134,6 +149,10 @@ class Aimbot:
         self.show_fps = True
         self.aim_method = "Smooth Aim"  # Default aim method
         self.target_priority = "Closest to Crosshair"  # Default target priority
+        self.sticky_aim = False  # Sticky aim toggle
+        self.sticky_target = None  # Current sticky target
+        self.sticky_lock_time = 0.3  # Lock time in seconds
+        self.sticky_last_lock = 0  # Last time target was locked
         # Pre-allocate arrays for performance
         self.lower_bright = np.array([0, 0, 180], dtype=np.uint8)
         self.upper_bright = np.array([180, 30, 255], dtype=np.uint8)
@@ -231,6 +250,8 @@ class AimbotWorker(QThread):
                 while not self._stop_flag.is_set():
                     # Only aim when right mouse is pressed
                     if not is_right_mouse_down():
+                        # Reset sticky target when RMB is released
+                        self.core.sticky_target = None
                         time.sleep(0.001)  # Reduced sleep time
                         continue
 
@@ -322,37 +343,101 @@ class AimbotWorker(QThread):
                             self.fpsUpdated.emit(fps)
                         continue
 
-                    # Apply target priority
-                    if self.core.target_priority == "Closest to Crosshair":
-                        # Find closest valid target
-                        valid_distances = distances[valid_indices]
-                        closest_idx = valid_indices[np.argmin(valid_distances)]
-                        closest = head_positions[closest_idx]
-                    elif self.core.target_priority == "Largest Target":
-                        # Find largest valid target
-                        valid_sizes = [box_sizes[i] for i in valid_indices]
-                        largest_idx = valid_indices[np.argmax(valid_sizes)]
-                        closest = head_positions[largest_idx]
-                    elif self.core.target_priority == "Smallest Target":
-                        # Find smallest valid target
-                        valid_sizes = [box_sizes[i] for i in valid_indices]
-                        smallest_idx = valid_indices[np.argmin(valid_sizes)]
-                        closest = head_positions[smallest_idx]
-                    elif self.core.target_priority == "Closest and Largest":
-                        # Combine distance and size (normalized)
-                        valid_distances = distances[valid_indices]
-                        valid_sizes = [box_sizes[i] for i in valid_indices]
-                        # Normalize values
-                        norm_distances = valid_distances / np.max(valid_distances)
-                        norm_sizes = np.array(valid_sizes) / np.max(valid_sizes)
-                        # Combine with weights (70% distance, 30% size)
-                        combined_scores = 0.7 * norm_distances + 0.3 * (1 - norm_sizes)
-                        best_idx = valid_indices[np.argmin(combined_scores)]
-                        closest = head_positions[best_idx]
-                    else:  # Default to closest
-                        valid_distances = distances[valid_indices]
-                        closest_idx = valid_indices[np.argmin(valid_distances)]
-                        closest = head_positions[closest_idx]
+                    # Handle sticky aim
+                    current_time = time.time()
+                    target_locked = False
+                    closest = None
+                    
+                    if self.core.sticky_aim:
+                        # Check if we should keep the current sticky target
+                        if self.core.sticky_target is not None:
+                            # Check if the sticky target is still valid
+                            target_still_valid = False
+                            for i in valid_indices:
+                                hx, hy = head_positions[i]
+                                dist = np.sqrt((hx - self.core.sticky_target[0])**2 + (hy - self.core.sticky_target[1])**2)
+                                if dist < self.core.lock_radius:
+                                    target_still_valid = True
+                                    closest = self.core.sticky_target
+                                    target_locked = True
+                                    break
+                            
+                            # If target is no longer valid, release it
+                            if not target_still_valid:
+                                self.core.sticky_target = None
+                                self.core.sticky_last_lock = 0
+                        
+                        # If no sticky target or it expired, acquire a new one
+                        if self.core.sticky_target is None or (current_time - self.core.sticky_last_lock) > self.core.sticky_lock_time:
+                            # Apply target priority to select new sticky target
+                            if self.core.target_priority == "Closest to Crosshair":
+                                # Find closest valid target
+                                valid_distances = distances[valid_indices]
+                                closest_idx = valid_indices[np.argmin(valid_distances)]
+                                closest = head_positions[closest_idx]
+                            elif self.core.target_priority == "Largest Target":
+                                # Find largest valid target
+                                valid_sizes = [box_sizes[i] for i in valid_indices]
+                                largest_idx = valid_indices[np.argmax(valid_sizes)]
+                                closest = head_positions[largest_idx]
+                            elif self.core.target_priority == "Smallest Target":
+                                # Find smallest valid target
+                                valid_sizes = [box_sizes[i] for i in valid_indices]
+                                smallest_idx = valid_indices[np.argmin(valid_sizes)]
+                                closest = head_positions[smallest_idx]
+                            elif self.core.target_priority == "Closest and Largest":
+                                # Combine distance and size (normalized)
+                                valid_distances = distances[valid_indices]
+                                valid_sizes = [box_sizes[i] for i in valid_indices]
+                                # Normalize values
+                                norm_distances = valid_distances / np.max(valid_distances)
+                                norm_sizes = np.array(valid_sizes) / np.max(valid_sizes)
+                                # Combine with weights (70% distance, 30% size)
+                                combined_scores = 0.7 * norm_distances + 0.3 * (1 - norm_sizes)
+                                best_idx = valid_indices[np.argmin(combined_scores)]
+                                closest = head_positions[best_idx]
+                            else:  # Default to closest
+                                valid_distances = distances[valid_indices]
+                                closest_idx = valid_indices[np.argmin(valid_distances)]
+                                closest = head_positions[closest_idx]
+                            
+                            # Set new sticky target
+                            self.core.sticky_target = closest
+                            self.core.sticky_last_lock = current_time
+                            target_locked = True
+                    else:
+                        # Normal targeting without sticky aim
+                        # Apply target priority
+                        if self.core.target_priority == "Closest to Crosshair":
+                            # Find closest valid target
+                            valid_distances = distances[valid_indices]
+                            closest_idx = valid_indices[np.argmin(valid_distances)]
+                            closest = head_positions[closest_idx]
+                        elif self.core.target_priority == "Largest Target":
+                            # Find largest valid target
+                            valid_sizes = [box_sizes[i] for i in valid_indices]
+                            largest_idx = valid_indices[np.argmax(valid_sizes)]
+                            closest = head_positions[largest_idx]
+                        elif self.core.target_priority == "Smallest Target":
+                            # Find smallest valid target
+                            valid_sizes = [box_sizes[i] for i in valid_indices]
+                            smallest_idx = valid_indices[np.argmin(valid_sizes)]
+                            closest = head_positions[smallest_idx]
+                        elif self.core.target_priority == "Closest and Largest":
+                            # Combine distance and size (normalized)
+                            valid_distances = distances[valid_indices]
+                            valid_sizes = [box_sizes[i] for i in valid_indices]
+                            # Normalize values
+                            norm_distances = valid_distances / np.max(valid_distances)
+                            norm_sizes = np.array(valid_sizes) / np.max(valid_sizes)
+                            # Combine with weights (70% distance, 30% size)
+                            combined_scores = 0.7 * norm_distances + 0.3 * (1 - norm_sizes)
+                            best_idx = valid_indices[np.argmin(combined_scores)]
+                            closest = head_positions[best_idx]
+                        else:  # Default to closest
+                            valid_distances = distances[valid_indices]
+                            closest_idx = valid_indices[np.argmin(valid_distances)]
+                            closest = head_positions[closest_idx]
 
                     if closest is not None:
                         hx, hy = closest
@@ -651,6 +736,12 @@ class MainWindow(QMainWindow):
         self.aimHeightSlider = self._slider(3, 30, aim_div, self.on_aim_height_changed)
         self.aimHeightBadge = ValueBadge(str(aim_div))
 
+        # Sticky Aim Toggle
+        self.stickyAimLabel = QLabel("Sticky Aim")
+        self.stickyAimCheckbox = QCheckBox()
+        self.stickyAimCheckbox.setChecked(self.aimbot.sticky_aim)
+        self.stickyAimCheckbox.stateChanged.connect(self.on_sticky_aim_changed)
+
         # Layout grid
         row = 0
         grid.addWidget(self.fovLabel, row, 0)
@@ -683,6 +774,11 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.aimHeightLabel, row, 0)
         grid.addWidget(self.aimHeightSlider, row, 1)
         grid.addWidget(self.aimHeightBadge, row, 2)
+        row += 1
+
+        grid.addWidget(self.stickyAimLabel, row, 0)
+        grid.addWidget(self.stickyAimCheckbox, row, 1)
+        row += 1
 
         return card
 
@@ -734,12 +830,9 @@ class MainWindow(QMainWindow):
     def on_model_changed(self, model_name: str):
         # Show a warning dialog before switching models
         reply = QMessageBox.question(
-            self, 
-            "Model Change", 
+            self, "Model Change", 
             f"Switch to {model_name}? This may take a moment if the model needs to be downloaded.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        
+            QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             success = self.aimbot.switch_model(model_name)
             if not success:
@@ -777,6 +870,10 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_target_priority_changed(self, priority: str):
         self.aimbot.target_priority = priority
+
+    @Slot(int)
+    def on_sticky_aim_changed(self, state: int):
+        self.aimbot.sticky_aim = (state == Qt.Checked)
 
     # ------------------- Controls -------------------
     @Slot()
@@ -934,16 +1031,26 @@ class MainWindow(QMainWindow):
             border: none;
             border-radius: 12px;
         }
-        QComboBox::down-arrow {
-            image: url(none);
-            width: 0px;
-            height: 0px;
-        }
         QComboBox QAbstractItemView {
             background: #161618;
             border: 1px solid #2a2a2e;
             selection-background-color: #7f0f0f;
             border-radius: 8px;
+        }
+        
+        QCheckBox {
+            spacing: 5px;
+        }
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+            border: 1px solid #34343a;
+            background: #2a2a2e;
+            border-radius: 4px;
+        }
+        QCheckBox::indicator:checked {
+            background: #7f0f0f;
+            border: 1px solid #9a1b1b;
         }
         
         QMessageBox {
