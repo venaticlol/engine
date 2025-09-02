@@ -62,7 +62,7 @@ def centered_box(screen_w, screen_h, fov):
 def get_model_path(model_name):
     """Get the path where the model should be stored"""
     home = Path.home()
-    model_dir = home / ".sakura_triggerbot" / "models"
+    model_dir = home / ".triggerbot" / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     return model_dir / f"{model_name}.pt"
 
@@ -132,6 +132,12 @@ class Triggerbot:
         # Pre-allocate arrays for performance
         self.lower_bright = np.array([0, 0, 180], dtype=np.uint8)
         self.upper_bright = np.array([180, 30, 255], dtype=np.uint8)
+        
+        # Knife check features
+        self.knife_check_enabled = False
+        self.knife_template = None
+        self.knife_template_path = None
+        self.load_knife_template()
 
     def load_model(self, model_name):
         """Load a YOLO model, downloading if necessary"""
@@ -183,6 +189,48 @@ class Triggerbot:
 
         return False
 
+    def load_knife_template(self):
+        """Load the knife equipped template image"""
+        try:
+            # Look for equipped.png in the same directory as the script
+            script_dir = Path(__file__).parent
+            template_path = script_dir / "equipped.png"
+            
+            if template_path.exists():
+                self.knife_template_path = str(template_path)
+                # Load in grayscale for faster template matching
+                self.knife_template = cv2.imread(self.knife_template_path, cv2.IMREAD_GRAYSCALE)
+                print(f"Knife template loaded from {template_path}")
+            else:
+                print(f"Warning: Knife template not found at {template_path}")
+        except Exception as e:
+            print(f"Error loading knife template: {e}")
+
+    def is_knife_equipped(self, frame):
+        """Check if knife is equipped by looking for equipped.png on screen"""
+        if not self.knife_check_enabled or self.knife_template is None:
+            return False
+            
+        try:
+            # Convert frame to grayscale
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Perform template matching
+            result = cv2.matchTemplate(gray_frame, self.knife_template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            
+            # If match confidence is above threshold, knife is equipped
+            return max_val > 0.8  # 80% confidence threshold
+        except Exception as e:
+            print(f"Error in knife detection: {e}")
+            return False
+
+    def set_knife_check(self, enabled):
+        """Enable or disable knife check"""
+        self.knife_check_enabled = enabled
+        if enabled and self.knife_template is None:
+            self.load_knife_template()
+
 # ------------------- PySide6 UI -------------------
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtGui import QIcon, QAction, QFont, QShortcut, QKeySequence
@@ -223,6 +271,9 @@ class TriggerbotWorker(QThread):
             last_time = time.perf_counter()
             frame_buffer = None
             
+            # Knife detection variables
+            knife_detected = False
+            
             try:
                 while not self._stop_flag.is_set():
                     # Check trigger key condition
@@ -231,6 +282,25 @@ class TriggerbotWorker(QThread):
                         (self.core.trigger_key == "left_mouse" and is_left_mouse_down()) or
                         (self.core.trigger_key == "always")
                     )
+                    
+                    # If knife check is enabled, check for knife first
+                    if self.core.knife_check_enabled:
+                        try:
+                            # Capture full screen for knife detection
+                            full_screen = {"top": 0, "left": 0, "width": self.core.screen_w, "height": self.core.screen_h}
+                            knife_screen = sct.grab(full_screen)
+                            knife_frame = np.frombuffer(knife_screen.rgb, dtype=np.uint8).reshape((knife_screen.height, knife_screen.width, 3))
+                            
+                            # Check if knife is equipped
+                            knife_detected = self.core.is_knife_equipped(knife_frame)
+                            
+                            # If knife detected, skip aimbot functionality
+                            if knife_detected:
+                                self.statusText.emit("Knife Equipped - Paused")
+                                time.sleep(0.1)  # Check again in 100ms
+                                continue
+                        except Exception as e:
+                            pass  # Continue if knife detection fails
                     
                     if not trigger_condition:
                         time.sleep(0.001)  # Reduced sleep time
@@ -407,7 +477,7 @@ class MainWindow(QMainWindow):
         self.worker: TriggerbotWorker | None = None
 
         # Window
-        self.setWindowTitle("sakura triggerbot UI")
+        self.setWindowTitle("triggerbot Configuration UI")
         self.setMinimumSize(440, 685)
 
         # Icon (gracefully handle if not present)
@@ -436,7 +506,7 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.fpsLabel)
 
         footer.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        credit = QLabel("Developed by: Japan")
+        credit = QLabel("Developed by: godtier")
         credit.setObjectName("Subtle")
         footer.addWidget(credit)
         root.addLayout(footer)
@@ -457,9 +527,9 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(8)
 
-        title = QLabel("Sakura Triggerbot UI")
+        title = QLabel("Triggerbot Configuration UI")
         title.setObjectName("H1")
-        subtitle = QLabel("• Auto-click when target detected")
+        subtitle = QLabel("• Da-Hood based trigger-bot")
         subtitle.setObjectName("Subtle")
 
         status_row = QHBoxLayout()
@@ -552,6 +622,12 @@ class MainWindow(QMainWindow):
         self.triggerKeyLayout.addWidget(self.leftMouseRadio)
         self.triggerKeyLayout.addWidget(self.alwaysRadio)
 
+        # Knife Check
+        self.knifeCheckLabel = QLabel("Knife Check")
+        self.knifeCheckCheckbox = QCheckBox("Enable")
+        self.knifeCheckCheckbox.setChecked(self.triggerbot.knife_check_enabled)
+        self.knifeCheckCheckbox.stateChanged.connect(self.on_knife_check_changed)
+
         # Layout grid
         row = 0
         grid.addWidget(self.fovLabel, row, 0)
@@ -584,6 +660,10 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self.triggerKeyLabel, row, 0)
         grid.addLayout(self.triggerKeyLayout, row, 1, 1, 2)
+        row += 1
+
+        grid.addWidget(self.knifeCheckLabel, row, 0)
+        grid.addWidget(self.knifeCheckCheckbox, row, 1, 1, 2)
 
         return card
 
@@ -683,6 +763,17 @@ class MainWindow(QMainWindow):
         else:
             self.triggerbot.trigger_key = "always"
 
+    @Slot(int)
+    def on_knife_check_changed(self, state: int):
+        enabled = state == Qt.Checked
+        self.triggerbot.set_knife_check(enabled)
+        if enabled and self.triggerbot.knife_template is None:
+            QMessageBox.warning(
+                self,
+                "Knife Template Missing",
+                "equipped.png not found. Please place the template image in the same directory as this script."
+            )
+
     # ------------------- Controls -------------------
     @Slot()
     def start_clicked(self):
@@ -730,7 +821,7 @@ class MainWindow(QMainWindow):
     # ------------------- Styling -------------------
     def _qss(self) -> str:
         # Tailored neon red/black modern style
-        return """
+        qss = """
         * { 
             color: #fce6e6; 
             font-family: 'Segoe UI', 'Inter', 'Ubuntu', sans-serif;
@@ -872,20 +963,37 @@ class MainWindow(QMainWindow):
             background-color: #ff4d4d;
         }
         
+        QCheckBox {
+            spacing: 5px;
+        }
+        
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+        }
+        
+        QCheckBox::indicator:unchecked {
+            border: 2px solid #555;
+            border-radius: 4px;
+            background-color: #2a2a2e;
+        }
+        
+        QCheckBox::indicator:checked {
+            border: 2px solid #ff4d4d;
+            border-radius: 4px;
+            background-color: #ff4d4d;
+        }
+        
         QMessageBox {
             background: #0d0d0f;
         }
         """
+        return qss
 
 # ------------------- Entry -------------------
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("sakura.lol")
-
-    # Try to set app icon globally if present
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sakura.ico")
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+    app.setApplicationName("triggerbot configuration UI")
 
     w = MainWindow()
     w.resize(520, 785)
@@ -895,5 +1003,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
